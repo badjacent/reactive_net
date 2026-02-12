@@ -1,113 +1,65 @@
 # Architecture & Design
 
-## Overview
+## Reactive Sets and Lifetimes: A Conceptual Overview
 
-`com.hollerson.reactivesets` layers reactive collection semantics on top of Rx.NET. The core idea: model a **set** not as a static snapshot but as an `IObservable` stream of **change notifications**. Downstream operations (union, intersect, filter, map) subscribe to these change streams and incrementally maintain their own state — no full recomputation needed when a single element is added or removed.
+### Basic Reactive Sets
 
-## Core Abstractions
+A **reactive set** is a single event stream. What makes it look like a set is the concept of a **lifetime**: each item in the set has a lifetime — it is added, optionally updated, and eventually removed. Multiple lifetimes are multiplexed through the one stream, interleaved in time. At any moment, the set's membership is the collection of currently active lifetimes.
 
-### Change Notification Model
+A lifetime is a sequence of events for one logical item:
 
-Every reactive set emits a stream of `SetChange<T>` values:
-
-```
-SetChange<T>
-├── Add(T item)
-├── Remove(T item)
-└── Clear
-```
-
-`SetChange<T>` is a discriminated-union-style type (implemented as a sealed record hierarchy). Each variant carries exactly the information a downstream operator needs to update its state.
-
-A reactive set's observable surface is:
+1. **Add(lifetime, item)** — the item enters the set. The lifetime begins.
+2. **Update(lifetime, item)** (zero or more) — the item's state changes while it remains in the set.
+3. **Delete(lifetime)** — the item leaves the set. The lifetime ends.
 
 ```
-IObservable<SetChange<T>>
+Stream over time:
+
+  Add(1, alice)      → {(1, alice)}
+  Add(2, bob)        → {(1, alice), (2, bob)}
+  Update(1, beth)    → {(1, beth), (2, bob)}
+  Delete(2)          → {(1, beth)}
+  Add(3, carol)      → {(1, beth), (3, carol)}
 ```
 
-This is the fundamental building block — all set operations consume and produce `IObservable<SetChange<T>>` streams.
+This is one stream — an `IObservable<IRxSetChange<T>[]>` — with three lifetimes multiplexed through it.
 
-### `IReactiveSet<T>`
+### Operators - Some Examples
 
-The primary abstraction combining:
+Operators manipulate reactive sets. Their inputs vary — an operator might transform one reactive set into another, bridge a plain `IObservable<T>` into the reactive set world, or combine two reactive sets. Here are some example operators - there are more in the detailed documentation.
 
-| Member | Purpose |
-|--------|---------|
-| `IObservable<SetChange<T>> Changes` | Stream of granular add/remove/clear notifications |
-| `IReadOnlySet<T> CurrentValue` | Snapshot of the current membership (for late subscribers or imperative queries) |
-| `int Count` | Current element count |
+#### RxSelectSingleLifetime
 
-`IReactiveSet<T>` does **not** extend `ISet<T>` — it is a read-only, observable projection. Mutation happens through a concrete `ReactiveSet<T>` class that implements `IReactiveSet<T>` and exposes `Add`, `Remove`, and `Clear` methods.
+Bridges a plain `IObservable<T>` into a reactive set with a single lifetime. First value → Add, subsequent values → Update, completion → Delete. The result always contains zero or one items.
 
-### Relationship to System.Reactive
+Example: a configuration service pushes `IObservable<AppConfig>` whenever the config changes. `RxSelectSingleLifetime` turns this into an `IReactiveSet<AppConfig>` with one lifetime that tracks the current config — so it can participate in joins and other set operations.
 
-```
-System.Reactive primitives          This library
-─────────────────────────────       ────────────────────────
-IObservable<T>                  →   IObservable<SetChange<T>>
-IObserver<T>                    →   (subscribers to change streams)
-IScheduler                      →   (used for concurrency control)
-Observable extension methods    →   SetObservable extension methods
-```
+#### RxMap
 
-The library is a **consumer** of System.Reactive, not a fork. All scheduling, subscription lifecycle, and error/completion semantics follow standard Rx conventions.
+Transforms each lifetime's value. 1:1 — every upstream lifetime produces exactly one downstream lifetime. Lifetime structure is unchanged; only the items are transformed.
 
-## Data Flow
+Example: given a reactive set of `User` objects, `RxMap(user => user.DisplayName)` produces a reactive set of strings. When a user's display name changes (Update upstream), the corresponding string updates downstream.
 
-```
- ┌──────────────┐
- │ ReactiveSet  │  (mutable source)
- │  Add / Remove│
- └──────┬───────┘
-        │ IObservable<SetChange<T>>
-        ▼
- ┌──────────────┐     ┌──────────────┐
- │   Filter     │     │     Map      │
- │ (predicate)  │     │ (selector)   │
- └──────┬───────┘     └──────┬───────┘
-        │                     │
-        ▼                     ▼
- ┌──────────────────────────────────┐
- │           Union / Intersect      │
- │  (combines two change streams)   │
- └──────────────┬───────────────────┘
-                │ IObservable<SetChange<T>>
-                ▼
-         [ subscriber ]
-```
+#### RxJoin
 
-1. A `ReactiveSet<T>` is the entry point — mutable, emits `SetChange<T>` on each mutation.
-2. Intermediate operators (`Filter`, `Map`, `Union`, `Intersect`, `Except`, `SymmetricDifference`) each maintain internal state and translate upstream changes into downstream changes.
-3. Terminal subscribers observe the final composed stream.
+Combines two reactive sets like a SQL inner join, but reactive. When a lifetime in the left set and a lifetime in the right set satisfy a join condition, a downstream lifetime exists carrying the combined value. The result updates incrementally as either side changes.
 
-## Operator State Management
+Example: a reactive set of `Order` objects and a reactive set of `Customer` objects. `RxJoin(order => order.CustomerId, customer => customer.Id)` produces a reactive set of `(Order, Customer)` pairs. When a customer updates their address, every joined order/customer pair for that customer updates downstream. This can then be combined with RxMap.
 
-Each set operator maintains just enough internal state to produce correct incremental output:
+### Concrete Implementations
 
-| Operator | Internal State | Behavior on Add(x) upstream |
-|----------|---------------|----------------------------|
-| **Filter** | None (stateless pass-through) | Emit `Add(x)` if predicate matches, else skip |
-| **Map** | Mapping cache `T → U` | Emit `Add(selector(x))`, cache mapping |
-| **Union** | Reference counts per element | Increment refcount; emit `Add(x)` only if refcount goes from 0 → 1 |
-| **Intersect** | Presence flags per source | Emit `Add(x)` only when present in all sources |
-| **Except** | Elements from both sources | Emit `Add(x)` if in left and not in right |
+A reactive set is an interface — something has to produce the stream. Two basic implementations:
 
-## Threading & Schedulers
+#### ConstantReactiveSet
 
-- **Default:** operators do not introduce concurrency. If the source emits on a particular scheduler, downstream operators process on the same scheduler.
-- **ObserveOn / SubscribeOn:** standard Rx operators can be applied to any `IObservable<SetChange<T>>` stream to control scheduling.
-- **Thread safety of `ReactiveSet<T>`:** mutations (`Add`, `Remove`, `Clear`) will be serialized. Subscribers receive notifications on the calling thread unless explicitly scheduled elsewhere.
-- **`CurrentValue` consistency:** accessing `CurrentValue` while changes are in flight is a point-in-time snapshot — it may not yet reflect changes that are currently propagating through the pipeline.
+A fixed collection. On subscription, it emits an Add for each item and never changes after that. Useful as a static input to operators — e.g., a fixed set of reference data that other sets join against.
 
-## Error & Completion Semantics
+#### MutableReactiveSet
 
-- **Error:** if a source set's change stream errors, the error propagates downstream per standard Rx semantics. Operators do not swallow errors.
-- **Completion:** a source set completes its change stream when disposed. Composite operators (union, intersect) complete when all upstream sources have completed.
-- **Disposal:** subscribing to a reactive set pipeline returns an `IDisposable`. Disposing it tears down the subscription chain, same as any Rx subscription.
+A collection that can be changed imperatively. Calling its `Add`, `Update`, and `Delete` methods emits the corresponding events on the stream. This is the primary entry point for feeding external data into the reactive set world.
 
-## Design Principles
+### Batched Events
 
-1. **Incremental over recomputation** — every operator should do O(1) work per change, not O(n) over the whole set.
-2. **Rx-native** — change streams are plain `IObservable<SetChange<T>>`, composable with all existing Rx operators.
-3. **No hidden threads** — concurrency is explicit via schedulers, never implicit.
-4. **Snapshot availability** — `CurrentValue` provides an escape hatch for imperative code that needs the current state.
+The conceptual model presents events one at a time for clarity. In the actual API, the change stream is `IObservable<IRxSetChange<T>[]>` — each notification delivers an array of events. Experience shows that this batching is necessary for performance. The conceptual model still holds within a batch — events are ordered and obey the same preconditions.
+
+See [requirements.md](requirements.md) for detailed specifications.

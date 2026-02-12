@@ -1,222 +1,208 @@
-# API Surface Specification
-
-## Namespace
+# API Surface
 
 All types live under `com.hollerson.reactivesets`.
 
----
+## Core Types
 
-## Change Notification Types
+### `IRxSetChange<T>`
 
-### `SetChange<T>`
-
-Sealed record hierarchy representing a single change to a set.
+A single change event. Three variants: Add and Update carry a lifetime identifier and an item; Delete carries only the lifetime.
 
 ```csharp
-public abstract record SetChange<T>;
-public sealed record Add<T>(T Item) : SetChange<T>;
-public sealed record Remove<T>(T Item) : SetChange<T>;
-public sealed record Clear<T> : SetChange<T>;
+public interface IRxSetChange<out T> where T : class { }
+
+public sealed record RxSetAdd<T>(object Lifetime, T Item) : IRxSetChange<T>
+    where T : class;
+
+public sealed record RxSetUpdate<T>(object Lifetime, T Item) : IRxSetChange<T>
+    where T : class;
+
+public sealed record RxSetDelete<T>(object Lifetime) : IRxSetChange<T>
+    where T : class;
 ```
-
----
-
-## Core Interfaces
 
 ### `IReactiveSet<T>`
 
-Read-only observable view of a set.
+The core interface. A reactive set exposes a single change stream delivering batches of events.
 
 ```csharp
-public interface IReactiveSet<T> : IDisposable
+public interface IReactiveSet<T> where T : class
 {
-    /// Stream of granular change notifications.
-    IObservable<SetChange<T>> Changes { get; }
-
-    /// Point-in-time snapshot of current membership.
-    IReadOnlySet<T> CurrentValue { get; }
-
-    /// Current element count.
-    int Count { get; }
+    IObservable<IRxSetChange<T>[]> Changes { get; }
 }
 ```
 
----
+## Creating Reactive Sets
 
-## Concrete Classes
-
-### `ReactiveSet<T>`
-
-Mutable source set. Implements `IReactiveSet<T>` and provides mutation methods.
+### From a fixed collection
 
 ```csharp
-public class ReactiveSet<T> : IReactiveSet<T>
+var departments = new ConstantReactiveSet<Department>(new[]
 {
-    public ReactiveSet(IEqualityComparer<T>? comparer = null);
-
-    // --- IReactiveSet<T> ---
-    public IObservable<SetChange<T>> Changes { get; }
-    public IReadOnlySet<T> CurrentValue { get; }
-    public int Count { get; }
-
-    // --- Mutation ---
-    /// Returns true if the item was added (not already present).
-    public bool Add(T item);
-
-    /// Returns true if the item was removed (was present).
-    public bool Remove(T item);
-
-    /// Removes all elements, emits Clear.
-    public void Clear();
-
-    public void Dispose();
-}
+    new Department(1, "Engineering"),
+    new Department(2, "Sales"),
+});
+// On subscription, emits Add for each item. Never changes.
 ```
 
----
-
-## Set Operations (Extension Methods)
-
-All operations are extension methods on `IReactiveSet<T>`, returning a new `IReactiveSet<T>`.
+### From imperative mutations
 
 ```csharp
-public static class ReactiveSetExtensions
-{
-    /// Elements present in either set.
-    public static IReactiveSet<T> Union<T>(
-        this IReactiveSet<T> left,
-        IReactiveSet<T> right,
-        IEqualityComparer<T>? comparer = null);
+var users = new MutableReactiveSet<User, int>(user => user.Id);
 
-    /// Elements present in both sets.
-    public static IReactiveSet<T> Intersect<T>(
-        this IReactiveSet<T> left,
-        IReactiveSet<T> right,
-        IEqualityComparer<T>? comparer = null);
-
-    /// Elements in left but not in right.
-    public static IReactiveSet<T> Except<T>(
-        this IReactiveSet<T> left,
-        IReactiveSet<T> right,
-        IEqualityComparer<T>? comparer = null);
-
-    /// Elements in either set but not in both.
-    public static IReactiveSet<T> SymmetricDifference<T>(
-        this IReactiveSet<T> left,
-        IReactiveSet<T> right,
-        IEqualityComparer<T>? comparer = null);
-
-    /// Elements matching the predicate.
-    public static IReactiveSet<T> Where<T>(
-        this IReactiveSet<T> source,
-        Func<T, bool> predicate);
-
-    /// Projected elements (must remain unique under the result comparer).
-    public static IReactiveSet<TResult> Select<T, TResult>(
-        this IReactiveSet<T> source,
-        Func<T, TResult> selector,
-        IEqualityComparer<TResult>? comparer = null);
-}
+users.Add(new User(1, "Alice", "Engineering"));
+users.Update(new User(1, "Alice", "Sales"));
+users.Delete(1);
 ```
 
----
+The key selector (`user => user.Id`) maps items to lifetimes. The key type (`int` here) requires `IEquatable<TKey>`. An optional `IEqualityComparer<TKey>` can be provided.
 
-## Custom Rx Operators
-
-Extension methods on `IObservable<SetChange<T>>` for working directly with change streams.
+### From a plain observable
 
 ```csharp
-public static class SetChangeObservableExtensions
-{
-    /// Accumulate changes into a snapshot, emitting the full set after each change.
-    public static IObservable<IReadOnlySet<T>> Aggregate<T>(
-        this IObservable<SetChange<T>> changes,
-        IEqualityComparer<T>? comparer = null);
+IObservable<AppConfig> configStream = configService.GetConfigUpdates();
 
-    /// Buffer changes over a time window, emitting batched change lists.
-    public static IObservable<IReadOnlyList<SetChange<T>>> BufferChanges<T>(
-        this IObservable<SetChange<T>> changes,
-        TimeSpan window,
-        IScheduler? scheduler = null);
-
-    /// Convert a plain observable sequence into Add notifications
-    /// (useful for bridging non-set streams into the reactive-set world).
-    public static IObservable<SetChange<T>> ToSetChanges<T>(
-        this IObservable<T> source);
-}
+IReactiveSet<AppConfig> config = RxSelectSingleLifetime.Create(configStream);
+// First value → Add, subsequent values → Update, completion → Delete.
+// Always contains zero or one items.
 ```
 
----
-
-## Usage Examples
-
-### Creating and observing a reactive set
+### From a stream of observables
 
 ```csharp
-using com.hollerson.reactivesets;
+IObservable<IObservable<StockPrice>> priceFeeds = exchange.GetPriceFeeds();
 
-var set = new ReactiveSet<int>();
-
-set.Changes.Subscribe(change => Console.WriteLine(change));
-
-set.Add(1);   // prints: Add { Item = 1 }
-set.Add(2);   // prints: Add { Item = 2 }
-set.Remove(1); // prints: Remove { Item = 1 }
-
-Console.WriteLine(set.Count); // 1
+IReactiveSet<StockPrice> prices = RxSelectMultipleLifetimes.Create(priceFeeds);
+// Each inner IObservable<StockPrice> becomes one lifetime.
+// First value → Add, subsequent values → Update, inner completion → Delete.
+// RxSelectSingleLifetime is the special case where the outer stream emits once.
 ```
 
-### Composing set operations
+### From snapshots of a collection
 
 ```csharp
-var admins = new ReactiveSet<string>();
-var editors = new ReactiveSet<string>();
+IObservable<IEnumerable<User>> snapshots = pollingService.GetUsers();
 
-// People who are admins OR editors
-IReactiveSet<string> staff = admins.Union(editors);
-
-// People who are admins AND editors
-IReactiveSet<string> superUsers = admins.Intersect(editors);
-
-staff.Changes.Subscribe(c => Console.WriteLine($"Staff change: {c}"));
-
-admins.Add("Alice");   // Staff change: Add { Item = Alice }
-editors.Add("Alice");  // (no staff change — Alice already in union)
-editors.Add("Bob");    // Staff change: Add { Item = Bob }
-admins.Remove("Alice"); // (no staff change — Alice still in editors)
-editors.Remove("Alice"); // Staff change: Remove { Item = Alice }
+IReactiveSet<User> users = RxFromObservableCollection.Create(snapshots, user => user.Id);
+// Diffs each snapshot against the previous to produce Add/Update/Delete events.
 ```
 
-### Filtering and projection
+## Transforming
+
+### RxMap — project each item
 
 ```csharp
-var numbers = new ReactiveSet<int>();
-
-IReactiveSet<int> evens = numbers.Where(n => n % 2 == 0);
-IReactiveSet<string> labels = evens.Select(n => $"Item-{n}");
-
-labels.Changes.Subscribe(c => Console.WriteLine(c));
-
-numbers.Add(1); // (no output — filtered out)
-numbers.Add(2); // prints: Add { Item = Item-2 }
-numbers.Add(4); // prints: Add { Item = Item-4 }
-numbers.Remove(2); // prints: Remove { Item = Item-2 }
+IReactiveSet<string> names = users.RxMap(user => user.DisplayName);
+// 1:1 lifetimes. When a user's name changes (Update), the string updates downstream.
 ```
 
-### Bridging with standard Rx
+### RxFilter — keep items matching a predicate
 
 ```csharp
-IObservable<int> incoming = Observable.Interval(TimeSpan.FromSeconds(1))
-    .Select(i => (int)i);
+IReactiveSet<User> engineers = users.RxFilter(user => user.Department == "Engineering");
+// A user who changes department from Engineering to Sales:
+//   downstream sees a Delete (no longer matches).
+// A user who changes department from Sales to Engineering:
+//   downstream sees an Add (now matches).
+```
 
-// Convert plain observable to set-change stream
-IObservable<SetChange<int>> changes = incoming.ToSetChanges();
+### RxSelectMany — flatten nested sets
 
-// Accumulate into snapshots
-changes.Aggregate().Subscribe(snapshot =>
-    Console.WriteLine($"Set now contains {snapshot.Count} items"));
+Each upstream item produces a child set; the result is the flattened union.
 
-// Buffer changes over 5-second windows
-changes.BufferChanges(TimeSpan.FromSeconds(5)).Subscribe(batch =>
-    Console.WriteLine($"Batch of {batch.Count} changes"));
+```csharp
+// Each department has a reactive set of its members
+IReactiveSet<User> allUsers = departments.RxSelectMany(dept => dept.Members);
+// When a department is deleted, all its members disappear downstream.
+// When a department is added, all its members appear.
+```
+
+Array overload for static projections:
+
+```csharp
+// Each order has a fixed list of line items
+IReactiveSet<LineItem> allLineItems = orders.RxSelectMany(order => order.LineItems);
+// On order Update, the new line items are diffed against the old.
+```
+
+## Combining
+
+### RxJoin — inner join
+
+```csharp
+IReactiveSet<OrderDetail> orderDetails = orders.RxJoin(
+    customers,
+    order => order.CustomerId,
+    customer => customer.Id,
+    (order, customer) => new OrderDetail(order.Id, customer.Name, order.Total));
+// A downstream lifetime exists only while both sides have a matching lifetime.
+// When a customer updates their name, all their order details update downstream.
+```
+
+### RxLeftJoin — left join
+
+```csharp
+IReactiveSet<OrderView> orderViews = orders.RxLeftJoin(
+    customers,
+    order => order.CustomerId,
+    customer => customer.Id,
+    (order, customer) => new OrderView(order.Id, customer?.Name, order.Total));
+// Every order always has a downstream lifetime.
+// customer is null when no match exists; updates to non-null when a match appears.
+```
+
+## Grouping
+
+### RxGroupBy — partition by key
+
+```csharp
+IReactiveSet<IReactiveSet<User>> byDepartment = users.RxGroupBy(user => user.Department);
+// Each distinct department value produces a child reactive set.
+// Users moving between departments leave one group and join another.
+```
+
+## Materializing
+
+### MaterializedSet — synchronous queryable view
+
+```csharp
+var view = new MaterializedSet<User, int>(users, user => user.Id);
+
+// Synchronous queries at any time:
+int count = view.Count;
+IReadOnlyCollection<User> all = view.Items;
+User? alice = view.TryGet(1);
+bool exists = view.ContainsKey(1);
+```
+
+Subscribes to the source reactive set, maintains an internal collection, and exposes it for synchronous reads. Implements `IDisposable` to tear down the subscription.
+
+### RxSnapshot — full membership as an observable
+
+```csharp
+IObservable<User[]> allUsers = users.RxSnapshot();
+// Emits the full current membership as an array after each batch of changes.
+```
+
+### RxCount — current count as an observable
+
+```csharp
+IObservable<int> userCount = users.RxCount();
+// Emits the number of active lifetimes after each batch.
+```
+
+## Composing Operators
+
+Operators return `IReactiveSet<T>`, so they chain naturally:
+
+```csharp
+var activeEngineerOrders = orders
+    .RxJoin(customers, o => o.CustomerId, c => c.Id,
+        (order, customer) => new { order, customer })
+    .RxFilter(x => x.customer.Department == "Engineering")
+    .RxFilter(x => x.order.Status == OrderStatus.Active)
+    .RxMap(x => new OrderSummary(x.order.Id, x.customer.Name, x.order.Total));
+
+activeEngineerOrders.RxCount().Subscribe(count =>
+    Console.WriteLine($"Active engineering orders: {count}"));
 ```
