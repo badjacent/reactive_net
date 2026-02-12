@@ -1,0 +1,8 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/ReactiveSet/ReactiveSet.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/ReactiveSet.Tests/ReactiveSet.Tests.csproj" />
+  </Folder>
+</Solution>

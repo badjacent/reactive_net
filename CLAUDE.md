@@ -1,26 +1,25 @@
 # CLAUDE.md — Project Instructions
 
-## Current Phase: Documentation & Design
-
-This project is in the **documentation-first** phase. Do not write implementation code (C#, .csproj, etc.) unless the user explicitly asks for it.
-
-### What to do
-- Create, refine, and review documentation and design artifacts
-- Discuss architecture, API surface, and design trade-offs
-- Ensure docs are internally consistent (architecture aligns with API surface)
-
-### What NOT to do
-- Do not scaffold solution/project files
-- Do not write C# implementation or test code
-- Do not add NuGet package references
+## Current Phase: Implementation
 
 ### Project details
 - **Namespace:** `com.hollerson.reactivesets`
 - **Target framework:** .NET 8
 - **Primary dependency:** System.Reactive (Rx.NET)
+- **Test framework:** xUnit + System.Reactive.Testing
 - **Purpose:** Reactive sets/collections and custom Rx operators
 
+### Solution structure
+- `src/ReactiveSet/` — class library
+- `tests/ReactiveSet.Tests/` — xUnit tests
+
 ### Key documentation files
-- `README.md` — project overview and status
-- `docs/architecture.md` — high-level design and data flow
-- `docs/api-surface.md` — planned interfaces, classes, and method signatures
+- `docs/architecture.md` — conceptual overview
+- `docs/api-surface.md` — API guide for humans
+- `docs/requirements.md` — detailed specs for implementation
+
+### Build & test
+```
+dotnet build
+dotnet test
+```
