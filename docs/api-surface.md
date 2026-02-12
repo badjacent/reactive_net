@@ -117,12 +117,14 @@ IReactiveSet<User> allUsers = departments.RxSelectMany(dept => dept.Members);
 // When a department is added, all its members appear.
 ```
 
-Array overload for static projections:
+Array overload for static projections (requires a key selector for diffing):
 
 ```csharp
 // Each order has a fixed list of line items
-IReactiveSet<LineItem> allLineItems = orders.RxSelectMany(order => order.LineItems);
-// On order Update, the new line items are diffed against the old.
+IReactiveSet<LineItem> allLineItems = orders.RxSelectMany(
+    order => order.LineItems,
+    lineItem => lineItem.Id);
+// On order Update, the new line items are diffed against the old by key.
 ```
 
 ## Combining

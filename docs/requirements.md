@@ -4,7 +4,7 @@ See [architecture.md](architecture.md) for the conceptual overview, [api-surface
 
 ## IRxSetChange&lt;T&gt;
 
-Each event in the stream is an `IRxSetChange<T>`. The three variants — Add, Update, Delete — are described in the conceptual overview. This section covers their preconditions and guarantees.
+Each event in the stream is an `IRxSetChange<out T>` (covariant in `T`). The three concrete variants — `RxSetAdd<T>`, `RxSetUpdate<T>`, `RxSetDelete<T>` — are sealed records. This section covers their preconditions and guarantees.
 
 ### Preconditions
 
@@ -41,6 +41,7 @@ public interface IReactiveSet<T> where T : class
 - `Changes` exposes the batched change event stream.
 - `IReactiveSet<T>` does not expose mutation methods — those belong to concrete implementations.
 - `IReactiveSet<T>` does not implement `IDisposable`. Subscription lifetime is managed by the subscriber (via the `IDisposable` returned by `Subscribe`).
+- **Subscription replay:** all reactive sets replay their current state on subscription. A new subscriber receives an initial batch of `Add` events representing all currently active lifetimes, then receives subsequent changes as they occur. All subscribers see the same logical set state.
 
 ## Concrete Implementations
 
@@ -85,6 +86,7 @@ public class MutableReactiveSet<T, TKey> : IReactiveSet<T>
 - `Update(item)` — extracts the key, verifies an active lifetime exists, emits `Update`. Throws `InvalidOperationException` if the key is not active.
 - `Delete(key)` — verifies an active lifetime exists for the key, emits `Delete`. Throws `InvalidOperationException` if the key is not active.
 - Each mutation emits a batch containing a single event.
+- On subscription, emits a single batch containing an `Add` event for each currently active lifetime, replaying the current state. Subsequent mutations emit as normal.
 - The key type does not appear in the `IReactiveSet<T>` interface — it is an implementation detail of MutableReactiveSet.
 
 ## Relationship to System.Reactive
@@ -258,18 +260,21 @@ Update(1, orderB{custId=10})                                Update(OrderDetail(1
 **Input:** `IReactiveSet<TLeft>`, `IReactiveSet<TRight>`, `Func<TLeft, TKey>`, `Func<TRight, TKey>`, `Func<TLeft, TRight?, TResult>`
 **Output:** `IReactiveSet<TResult>`
 
-Like RxJoin, but the left side is always present. A downstream lifetime exists for every left lifetime; the right side is null when no match exists. The projection function receives a nullable right value.
+Like RxJoin, but the left side is always present. This is a many-to-many join mirroring SQL left join semantics: each (left lifetime, right lifetime) pair with matching keys produces a downstream lifetime, plus each unmatched left lifetime produces a downstream lifetime with a null right. The projection function receives a nullable right value.
+
+For example, if order A has `customerId=10` and there are 2 customers with key 10, there are 2 downstream lifetimes for order A. If there are 0 customers with key 10, there is 1 downstream lifetime with `right=null`.
 
 **Rules:**
-- Left `Add` → downstream `Add` with `projection(left, matchedRight)` (matchedRight is null if no match)
-- Right `Add` that matches an existing left → downstream `Update` with `projection(left, right)` (right goes from null to value)
-- Right `Delete` while matched → downstream `Update` with `projection(left, null)` (right goes from value to null)
-- Left `Delete` → downstream `Delete`
-- Either side `Update` while matched → downstream `Update` with `projection(newLeft, newRight)`
-- Left `Update` that changes the join key → downstream `Update` with `projection(left, newMatchedRight)` (newMatchedRight may be null or a different right)
-- Right `Update` that changes the join key → downstream `Update` on affected left lifetimes
+- Left `Add` with no matching right(s) → one downstream `Add` with `projection(left, null)`
+- Left `Add` with matching right(s) already active → downstream `Add` for each matching right, with `projection(left, right)`
+- Right `Add` that matches existing left(s) → for each matched left: if the left had a null-right downstream, `Update` it with `projection(left, right)`; if the left already had other right matches, emit an additional downstream `Add` with `projection(left, right)`
+- Right `Delete` while matched → for each matched left: downstream `Delete` for the pair. If this was the left's last right match, emit downstream `Add` with `projection(left, null)` to restore the null-right lifetime.
+- Left `Delete` → downstream `Delete` for all downstream lifetimes associated with this left (whether matched or null-right)
+- Either side `Update` while matched → downstream `Update` with `projection(newLeft, newRight)` on affected downstream lifetimes
+- Left `Update` that changes the join key → downstream `Delete` for old matches, then apply Left `Add` rules for the new key
+- Right `Update` that changes the join key → downstream `Delete` for old matches (restoring null-right lifetimes for affected lefts if needed), then apply Right `Add` rules for the new key
 
-**State:** must track all active lifetimes from both sides, indexed by join key. Must store current values from both sides to re-apply the projection.
+**State:** must track all active lifetimes from both sides, indexed by join key. Must track downstream lifetimes per (left, right) pair and per unmatched left. Must store current values from both sides to re-apply the projection.
 
 ### RxFilter
 
@@ -352,6 +357,10 @@ Bridges a stream of full collection snapshots into a reactive set by diffing eac
   - Keys present in both where the value is unchanged → no event
 
 A `IEqualityComparer<TKey>` may optionally be supplied for key comparison. Item equality (for detecting updates) uses `EqualityComparer<T>.Default`.
+
+**Source completion:** emit `Delete` for all active lifetimes (equivalent to diffing against an empty snapshot). The Changes stream stays open.
+
+**Source error:** emit `Delete` for all active lifetimes, then error the Changes stream.
 
 **State:** the previous snapshot as a `Dictionary<TKey, T>`, for diffing.
 
